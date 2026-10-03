@@ -1,0 +1,12 @@
+flowchart TD
+    A[Client / Image] --> B[FastAPI /predict]
+    B --> C[Image preprocessing]
+    C --> D[Default brightness/color heuristic or optional MobileNet]
+    D --> E[Prediction + confidence + latency]
+    E --> F[Structured JSON logging]
+    E --> G[In-memory metrics]
+    G --> H[Baseline and recent confidence windows]
+    H --> I[KS drift detector]
+    G --> J[Monitoring UI /monitoring]
+    G --> K[Prometheus-compatible /metrics]
+    L[GET /health] --> B
