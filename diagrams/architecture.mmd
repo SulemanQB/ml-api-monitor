@@ -9,4 +9,5 @@ flowchart TD
     H --> I[KS drift detector]
     G --> J[Monitoring UI /monitoring]
     G --> K[Prometheus-compatible /metrics]
-    L[GET /health] --> B
+    L[GET /health and /readyz] --> B
+    M[GET /livez] --> B

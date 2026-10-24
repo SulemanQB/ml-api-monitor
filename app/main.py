@@ -11,7 +11,7 @@ from .config import Settings, load_settings
 from .logging_config import configure_logging
 from .model import ImageClassifier
 from .monitoring import Monitor
-from .schemas import HealthResponse, MonitoringSnapshot, PredictionResponse
+from .schemas import HealthResponse, LivenessResponse, MonitoringSnapshot, PredictionResponse
 
 settings: Settings = load_settings()
 configure_logging(settings.log_level)
@@ -58,12 +58,33 @@ async def monitor_prediction_requests(request, call_next):
     return response
 
 
-@app.get("/health", response_model=HealthResponse)
-def health():
-    response = HealthResponse(status="ok" if model.loaded else "degraded", model_loaded=model.loaded)
+def model_health() -> HealthResponse:
+    return HealthResponse(status="ok" if model.loaded else "degraded", model_loaded=model.loaded)
+
+
+def readiness_response():
+    """Report whether this process can accept inference traffic."""
+    response = model_health()
     if not model.loaded:
         return JSONResponse(status_code=503, content=response.model_dump())
     return response
+
+
+@app.get("/health", response_model=HealthResponse)
+def health():
+    return readiness_response()
+
+
+@app.get("/readyz", response_model=HealthResponse)
+def readyz():
+    """Readiness probe. The Service withholds traffic until the model is loaded."""
+    return readiness_response()
+
+
+@app.get("/livez", response_model=LivenessResponse)
+def livez():
+    """Liveness probe. A model that failed to load must not restart the process."""
+    return LivenessResponse(status="ok")
 
 
 @app.post("/predict", response_model=PredictionResponse)

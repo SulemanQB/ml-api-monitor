@@ -36,7 +36,8 @@ flowchart TD
     H --> J[Baseline and recent confidence windows]
     J --> K[KS drift detector]
     K --> L[/monitoring JSON and Streamlit dashboard]
-    M[/health] --> B
+    M[/health and /readyz] --> B
+    N[/livez] --> B
 ```
 
 The log stream is structured process output. Drift is calculated from the monitor's bounded confidence windows, not by parsing logs.
@@ -52,6 +53,7 @@ The log stream is structured process output. Drift is calculated from the monito
 | Drift | SciPy two-sample KS test | Explainable comparison of confidence distributions |
 | UI | Streamlit | Small monitoring view for demonstrations |
 | Testing | Pytest, FastAPI TestClient | Deterministic unit and API coverage |
+| Deployment | Docker, Kubernetes, Prometheus, kind | Local cluster with probes, an HPA, and a per-pod scrape |
 
 ## Project Structure
 
@@ -72,11 +74,19 @@ ml-api-monitor/
 │   ├── generate_demo.py   # synthetic stress-input traffic generator
 │   └── smoke_test.py      # live endpoint check
 ├── tests/                 # API, monitoring, drift, and config tests
+├── deploy/
+│   ├── k8s/               # API, HPA, and Prometheus manifests
+│   └── kind/              # kind cluster config and metrics-server patch
+├── scripts/install_k8s_tools.sh
+├── scripts/k8s_smoke.sh
+├── .github/workflows/ci.yml
 ├── .env.example
 ├── requirements-dashboard.txt
 ├── requirements-mobilenet.txt
 ├── pyproject.toml         # pytest discovery configuration
 ├── requirements.txt
+├── Dockerfile
+├── Makefile
 └── README.md
 ```
 
@@ -196,6 +206,71 @@ Settings are read from environment variables and validated at startup:
 | `MAX_IMAGE_PIXELS` | `4000000` | Maximum decoded image area |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` |
 
+## Deploying on Kubernetes
+
+Each API pod runs one Uvicorn process. The Deployment keeps two pods available, probes the real health endpoints before sending traffic, and Prometheus scrapes `/metrics` on each ready pod. Counters and drift windows stay inside the process that recorded them. A second replica does not share that state. Prometheus is what aggregates the series.
+
+```mermaid
+flowchart LR
+  client[Client] --> svc[Service ml-api]
+  svc --> api1[Pod ml-api]
+  svc --> api2[Pod ml-api]
+  cm[ConfigMap ml-api-config] --> api1
+  cm --> api2
+  secret[Secret ml-api-settings] --> api1
+  secret --> api2
+  hpa[HPA ml-api] --> deploy[Deployment ml-api]
+  ms[metrics-server] --> hpa
+  prom[Prometheus] -->|GET /metrics on each ready pod| api1
+  prom -->|GET /metrics on each ready pod| api2
+```
+
+### Quickstart
+
+Prerequisites: Docker, GNU Make, curl, Python 3.12 with the dependencies in `requirements.txt`, and `kind`, `kubectl`, and `kubeconform` on `PATH`. On Linux, `scripts/install_k8s_tools.sh` installs those three CLIs. The cluster config pins kind node `v1.37.0`.
+
+```bash
+python -m pip install -r requirements.txt
+make deploy
+make smoke
+make rollout
+make teardown
+```
+
+`make deploy` creates the kind cluster if needed, builds `ml-api-monitor:local`, loads that image into the node, applies `deploy/k8s`, and installs metrics-server `v0.9.0` with `--kubelet-insecure-tls`. `make smoke` port-forwards the API and Prometheus, runs `scripts/smoke_test.py`, and checks that the pod environment matches the ConfigMap and Secret, that Prometheus reports at least two API pods `up`, and that the HPA is receiving CPU metrics. `make rollout` restarts the API Deployment and waits for the rolling update. The kubectl context is `kind-ml-monitor`.
+
+GitHub Actions (`.github/workflows/ci.yml`) runs the unit tests, runs kubeconform on `kubectl kustomize deploy/k8s` for Kubernetes 1.37.0, then runs the same deploy, smoke, and rollout targets on a kind cluster.
+
+### What each resource does
+
+| Resource | Name | Role |
+| --- | --- | --- |
+| Namespace | `ml-monitor` | Isolates the API and Prometheus. |
+| ConfigMap | `ml-api-config` | Model name, drift method, window sizes, upload limits, and log level. Every key is injected into the process environment. |
+| Secret | `ml-api-settings` | `DRIFT_THRESHOLD`. This repository has no credentials. The threshold is public configuration, injected through a Secret so it can change without editing the Deployment. |
+| Deployment | `ml-api` | Two pods, one Uvicorn process each, with CPU and memory requests and limits. `maxUnavailable: 0` keeps a ready pod during a rolling update. The container filesystem is read-only except for an emptyDir at `/tmp`. |
+| Service | `ml-api` | ClusterIP on port 8000 for clients and the smoke test. Prometheus does not scrape this Service. A Service load-balances, which would collapse per-pod counters into one series. |
+| HorizontalPodAutoscaler | `ml-api` | Keeps 2 to 4 replicas. Scales on CPU utilization relative to the 100m request, with a target of 70%. |
+| ServiceAccount, Role, RoleBinding | `prometheus` | Lets Prometheus list and watch pods in `ml-monitor` only. The API pods do not mount a service account token. |
+| ConfigMap | `prometheus-config` | Scrape job `ml-api`. Pod discovery keeps Ready pods annotated `prometheus.io/scrape=true`, then scrapes port 8000 and path `/metrics`. |
+| Deployment | `prometheus` | One Prometheus 3.15.1 pod. Probes use `/-/ready` and `/-/healthy`. The TSDB is an emptyDir, so samples disappear when the pod is deleted. |
+| Service | `prometheus` | ClusterIP on port 9090 for port-forward and the PromQL check. |
+| metrics-server | `kube-system` | Installed by `make deploy` from the upstream `v0.9.0` manifest, then patched with `--kubelet-insecure-tls`. kind's kubelet certificate does not include the node IP that metrics-server dials. Without the flag the HPA target stays `<unknown>`. |
+
+API pods carry `prometheus.io/scrape`, `prometheus.io/port`, and `prometheus.io/path`. Changing the ConfigMap or Secret does not restart pods by itself. After an edit, run `kubectl --context kind-ml-monitor -n ml-monitor rollout restart deployment/ml-api`.
+
+### Probes and the HPA
+
+`/livez` returns 200 when the process can serve HTTP. It does not read the model. A failed model load should leave the pod NotReady rather than CrashLoopBackOff, because a restart will not fix a bad `MODEL_NAME` or a missing MobileNet dependency.
+
+`/readyz` returns 200 only when the model is loaded, and 503 otherwise. `/health` uses the same check so the existing demo and smoke test keep their meaning. The readiness probe removes a pod from the Service endpoints while that check is failing.
+
+`startupProbe` calls `/readyz` and allows about a minute before liveness counts. The default `tiny-color` path becomes ready once NumPy and SciPy have imported. The same probe gives the optional MobileNet path time to load without raising the liveness failure threshold.
+
+After startup, liveness calls `/livez` every 10 seconds and restarts the container after three failures. Readiness calls `/readyz` every 5 seconds.
+
+The HPA uses CPU because that is the signal metrics-server exposes. Scaling on latency or drift would need a custom metrics adapter, which this cluster does not run. Utilization is usage divided by the request, so the pod sets a 100m CPU request and a 256Mi memory request instead of limits alone. The limits are 1 CPU and 768Mi: the process can burst, and a memory leak is killed before it pressures the node. Scale-up adds one pod after 30 seconds. Scale-down waits 120 seconds and removes one pod at a time. The minimum of two replicas leaves a ready pod during a rolling update with `maxUnavailable: 0`, and it gives Prometheus two series so it is obvious the counters are not cluster-wide.
+
 ## Testing and Results
 
 Run the full suite with:
@@ -218,9 +293,9 @@ Measurements are environment- and sample-dependent. The repository does not clai
 
 ## Limitations and Future Improvements
 
-This is a single-process demonstration. Metrics and drift state reset on restart and are not shared across Uvicorn workers. The in-memory monitor is bounded and is not a replacement for persistent Prometheus/Grafana storage. The default path is a deterministic brightness and color heuristic, not a trained or validated production image model, and the confidence signal is not a reliable OOD detector.
+Each API pod runs one process. Metrics and drift state reset when that pod restarts and are not shared with other pods or with extra Uvicorn workers. Prometheus scrapes each pod so a query can aggregate rates; the demo Prometheus TSDB uses an emptyDir and is not durable storage. The default path is a deterministic brightness and color heuristic, not a trained or validated production image model, and the confidence signal is not a reliable OOD detector.
 
-Production extensions would include persistent metrics, centralized logs, OpenTelemetry traces, model versioning, input/data-quality monitoring, calibration, a validated dataset, alerting, authentication, containerization, and horizontal-scaling tests.
+Production extensions would include durable metrics and logs, OpenTelemetry traces, model versioning, input and data-quality monitoring, calibration, a validated dataset, alerting, authentication, and a custom metrics API if the autoscaler should react to latency or drift instead of CPU.
 
 ## Troubleshooting
 
@@ -232,6 +307,12 @@ Production extensions would include persistent metrics, centralized logs, OpenTe
 
 **Drift remains `INSUFFICIENT_DATA`**: increase traffic after the baseline fills, or lower the window sizes to values of at least 2 for a controlled demonstration.
 
+**`ImagePullBackOff` for `ml-api-monitor:local`**: the image is local to the kind node. Run `make kind-load` against the `ml-monitor` cluster.
+
+**The HPA target stays `<unknown>`**: metrics-server is not ready, or the kind kubelet TLS flag is missing. Check `kubectl --context kind-ml-monitor -n kube-system rollout status deployment/metrics-server` and confirm the container args include `--kubelet-insecure-tls`.
+
+**Prometheus has no `ml-api` series**: `kubectl --context kind-ml-monitor -n ml-monitor logs deploy/prometheus`. The scrape keeps only Ready pods annotated `prometheus.io/scrape=true`. The API Service is not a scrape target.
+
 ## How to Walk Through the Demo
 
 1. Start with [app/main.py](app/main.py) and explain the `/predict` contract and error boundary.
@@ -241,6 +322,7 @@ Production extensions would include persistent metrics, centralized logs, OpenTe
 5. Open `/metrics` and the Streamlit dashboard to explain operational visibility.
 6. Walk through [app/monitoring.py](app/monitoring.py) and [app/drift.py](app/drift.py), especially the baseline/recent windows and small-sample guard.
 7. Discuss why confidence drift is only a proxy, why in-memory state does not scale horizontally, and what would be added in production.
+8. Run `make deploy`, `make smoke`, and `make rollout`. Explain why `/livez` and `/readyz` are separate, why the HPA watches CPU, and why Prometheus scrapes pods rather than the Service.
 
 ## Project Information
 

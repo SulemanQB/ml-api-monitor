@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ml-monitor
+  labels:
+    app.kubernetes.io/name: ml-monitor
+    app.kubernetes.io/part-of: ml-api-monitor

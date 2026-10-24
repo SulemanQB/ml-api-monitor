@@ -21,6 +21,30 @@ def test_health():
     assert response.json()["model_loaded"] is True
 
 
+def test_livez_and_readyz_when_the_model_is_loaded():
+    live = client.get("/livez")
+    ready = client.get("/readyz")
+    assert live.status_code == 200
+    assert live.json()["status"] == "ok"
+    assert ready.status_code == 200
+    assert ready.json()["model_loaded"] is True
+
+
+def test_readyz_withholds_traffic_when_the_model_is_not_loaded(monkeypatch):
+    from app.main import model
+
+    monkeypatch.setattr(model, "loaded", False)
+    ready = client.get("/readyz")
+    health = client.get("/health")
+    live = client.get("/livez")
+    assert ready.status_code == 503
+    assert ready.json()["status"] == "degraded"
+    assert ready.json()["model_loaded"] is False
+    assert health.status_code == 503
+    assert live.status_code == 200
+    assert live.json()["status"] == "ok"
+
+
 def test_predict_returns_measured_fields():
     response = client.post("/predict", files={"file": ("sample.png", image_bytes(), "image/png")})
     assert response.status_code == 200

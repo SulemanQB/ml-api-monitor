@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Run tests
+        run: python -m pytest -q
+
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kubectl and kubeconform
+        run: ./scripts/install_k8s_tools.sh
+      - name: Lint rendered manifests
+        run: make lint-manifests
+
+  kind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Install kind, kubectl, and kubeconform
+        run: ./scripts/install_k8s_tools.sh
+      - name: Deploy to kind and smoke test
+        run: |
+          make deploy
+          make smoke
+          make rollout

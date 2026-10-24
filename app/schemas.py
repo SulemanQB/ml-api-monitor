@@ -8,6 +8,10 @@ class HealthResponse(BaseModel):
     model_loaded: bool
 
 
+class LivenessResponse(BaseModel):
+    status: str
+
+
 class PredictionResponse(BaseModel):
     prediction: str
     confidence: float = Field(ge=0, le=1)
